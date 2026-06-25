@@ -642,13 +642,14 @@ function App() {
             if (!text) return;
             const session = projTerms[tabId];
             if (!session?.sessionId) return;
+            const normalized = text.replace(/\r\n/g, '\n');
             if (session.hasTTY) {
-              const formatted = text.replace(/\n/g, '\r\n');
+              const formatted = normalized.replace(/\n/g, '\r\n');
               invoke('write_terminal', { sessionId: session.sessionId, data: formatted }).catch(() => {});
             } else {
-              const displayText = text.replace(/\n/g, '\r\n');
+              const displayText = normalized.replace(/\n/g, '\r\n');
               try { term.write(displayText); } catch {}
-              invoke('write_terminal', { sessionId: session.sessionId, data: text }).catch(() => {});
+              invoke('write_terminal', { sessionId: session.sessionId, data: normalized }).catch(() => {});
             }
           })
           .catch(() => {});
