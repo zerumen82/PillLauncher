@@ -642,19 +642,14 @@ function App() {
             if (!text) return;
             const session = projTerms[tabId];
             if (!session?.sessionId) return;
-            const displayText = text.replace(/\n/g, '\r\n');
-            const backendText = session.hasTTY ? displayText : text;
-            invoke('write_terminal', { sessionId: session.sessionId, data: backendText }).catch(() => {});
-            const CHUNK = 16384;
-            let i = 0;
-            const writeChunk = () => {
-              const chunk = displayText.slice(i, i + CHUNK);
-              if (!chunk) return;
-              i += CHUNK;
-              try { term.write(chunk); } catch {}
-              if (i < displayText.length) requestAnimationFrame(writeChunk);
-            };
-            writeChunk();
+            if (session.hasTTY) {
+              const formatted = text.replace(/\n/g, '\r\n');
+              invoke('write_terminal', { sessionId: session.sessionId, data: formatted }).catch(() => {});
+            } else {
+              const displayText = text.replace(/\n/g, '\r\n');
+              try { term.write(displayText); } catch {}
+              invoke('write_terminal', { sessionId: session.sessionId, data: text }).catch(() => {});
+            }
           })
           .catch(() => {});
       }, 10);
