@@ -643,12 +643,18 @@ function App() {
             const session = projTerms[tabId];
             if (!session?.sessionId) return;
             const displayText = text.replace(/\n/g, '\r\n');
-            if (session.hasTTY) {
-              invoke('write_terminal', { sessionId: session.sessionId, data: displayText }).catch(() => {});
-            } else {
-              invoke('write_terminal', { sessionId: session.sessionId, data: text }).catch(() => {});
-            }
-            try { term.write(displayText); } catch {}
+            const backendText = session.hasTTY ? displayText : text;
+            invoke('write_terminal', { sessionId: session.sessionId, data: backendText }).catch(() => {});
+            const CHUNK = 16384;
+            let i = 0;
+            const writeChunk = () => {
+              const chunk = displayText.slice(i, i + CHUNK);
+              if (!chunk) return;
+              i += CHUNK;
+              try { term.write(chunk); } catch {}
+              if (i < displayText.length) requestAnimationFrame(writeChunk);
+            };
+            writeChunk();
           })
           .catch(() => {});
       }, 10);

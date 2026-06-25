@@ -1335,7 +1335,7 @@ fn resume_cmd(path: String) -> Result<(), String> {
 // ══════════════════════════════════════════════════
 
 #[cfg(windows)]
-fn shell_program() -> &'static str { "powershell.exe" }
+fn shell_program() -> &'static str { "pwsh.exe" }
 #[cfg(not(windows))]
 fn shell_program() -> &'static str { "bash" }
 
