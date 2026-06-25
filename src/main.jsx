@@ -642,8 +642,12 @@ function App() {
             if (!text) return;
             const session = projTerms[tabId];
             if (!session?.sessionId) return;
-            invoke('write_terminal', { sessionId: session.sessionId, data: text }).catch(() => {});
-            try { term.write(text.replace(/\n/g, '\r\n')); } catch {}
+            let formatted = text;
+            if (session.hasTTY) {
+              formatted = text.replace(/\n/g, '\r\n');
+            }
+            invoke('write_terminal', { sessionId: session.sessionId, data: formatted }).catch(() => {});
+            try { term.write(formatted); } catch {}
           })
           .catch(() => {});
       }, 10);

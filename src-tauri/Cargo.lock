@@ -2412,7 +2412,7 @@ dependencies = [
 
 [[package]]
 name = "pilllauncher"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "libloading 0.8.9",
  "portable-pty",
