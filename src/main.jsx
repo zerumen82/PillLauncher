@@ -12,6 +12,9 @@ import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import './index.css';
 import ProjectTabs from './ProjectTabs.jsx';
+import settings from './settings.js';
+
+settings.init();
 
 window.addEventListener('error', (e) => {
   if (e.message && /paste.?image|Failed to paste/i.test(e.message)) { e.preventDefault(); return; }
@@ -156,30 +159,18 @@ function App() {
   const [searchResults, setSearchResults] = useState([]);
   const [searching, setSearching] = useState(false);
   const searchRef = useRef(null);
-  const [recentProjects, setRecentProjects] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('pill_recent') || '[]'); } catch { return []; }
-  });
+  const [recentProjects, setRecentProjects] = useState([]);
   const [showRecent, setShowRecent] = useState(false);
   const recentRef = useRef(null);
   const [consoleSearch, setConsoleSearch] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const settingsRef = useRef(null);
   const [debugEnabled, setDebugEnabled] = useState(false);
-  const [debugPort, setDebugPort] = useState(() => {
-    try { return parseInt(localStorage.getItem('pill_debug_port') || '5005', 10); } catch { return 5005; }
-  });
-  const [debugSuspend, setDebugSuspend] = useState(() => {
-    try { return localStorage.getItem('pill_debug_suspend') !== 'n'; } catch { return true; }
-  });
-  const [breakpoints, setBreakpoints] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('pill_breakpoints') || '{}'); } catch { return {}; }
-  });
-  const [editorFontSize, setEditorFontSize] = useState(() => {
-    try { return parseInt(localStorage.getItem('pill_font_size') || '12', 10); } catch { return 12; }
-  });
-  const [consoleFontSize, setConsoleFontSize] = useState(() => {
-    try { return parseInt(localStorage.getItem('pill_console_font_size') || '11', 10); } catch { return 11; }
-  });
+  const [debugPort, setDebugPort] = useState(5005);
+  const [debugSuspend, setDebugSuspend] = useState(true);
+  const [breakpoints, setBreakpoints] = useState({});
+  const [editorFontSize, setEditorFontSize] = useState(12);
+  const [consoleFontSize, setConsoleFontSize] = useState(11);
   const [toast, setToast] = useState(null);
   const [isGitHubRemote, setIsGitHubRemote] = useState(false);
 
@@ -197,6 +188,18 @@ function App() {
   }) : [];
   const gitModified = gitUnstaged.filter(([s]) => s !== '??' && s !== '!!');
   const gitUntracked = gitUnstaged.filter(([s]) => s === '??' || s === '!!');
+
+  useEffect(() => {
+    settings.onReady(async () => {
+      const s = await settings.getAll();
+      setRecentProjects(s.recent);
+      setDebugPort(s.debug_port);
+      setDebugSuspend(s.debug_suspend);
+      setBreakpoints(s.breakpoints);
+      setEditorFontSize(s.editor_font_size);
+      setConsoleFontSize(s.console_font_size);
+    });
+  }, []);
 
   const addLog = useCallback((text, kind = 'stdout') => setLogs(prev => [...prev, { text, kind, t: Date.now() }]), []);
   const clearLogs = useCallback(() => setLogs([]), []);
@@ -220,7 +223,7 @@ function App() {
     if (!p) return;
     setRecentProjects(prev => {
       const next = [p, ...prev.filter(r => r !== p)].slice(0, 8);
-      localStorage.setItem('pill_recent', JSON.stringify(next));
+      settings.set('recent', next);
       return next;
     });
   }, []);
@@ -280,7 +283,7 @@ function App() {
     setProjectOrder(prev => [...prev.filter(p => p !== sel), sel]);
     setActiveProject(sel);
     addRecent(sel);
-    localStorage.setItem('pill_last_project', sel);
+    settings.set('last_project', sel);
     setShowRecent(false);
     addLog(`Abriendo proyecto: ${sel}`, 'dim');
     try {
@@ -309,7 +312,7 @@ function App() {
     setProjectOrder(prev => {
       const next = prev.filter(p => p !== path);
       if (next.length === 0) {
-        localStorage.removeItem('atl_last_project');
+        settings.set('last_project', '');
         setActiveProject(null);
       } else {
         const newActive = activeProjectRef.current === path ? next[0] : activeProjectRef.current;
@@ -326,31 +329,24 @@ function App() {
     } catch (e) { addLog(String(e), 'err'); }
   }, [openProject, addLog]);
 
-  // Save project order to localStorage
   useEffect(() => {
-    localStorage.setItem('pill_project_order', JSON.stringify(projectOrder));
+    settings.set('project_order', projectOrder);
   }, [projectOrder]);
 
-  // Save active project
   useEffect(() => {
-    if (activeProject) localStorage.setItem('pill_last_project', activeProject);
+    if (activeProject) settings.set('last_project', activeProject);
   }, [activeProject]);
 
-  // Restore saved projects on startup
   useEffect(() => {
-    const saved = localStorage.getItem('pill_project_order');
-    if (saved) {
-      try {
-        const order = JSON.parse(saved);
-        if (Array.isArray(order) && order.length > 0) {
-          // Open all saved projects sequentially
-          order.forEach(p => openProject(p));
-          return;
-        }
-      } catch {}
-    }
-    const last = localStorage.getItem('atl_last_project');
-    if (last) openProject(last);
+    settings.onReady(async () => {
+      const order = await settings.get('project_order');
+      if (Array.isArray(order) && order.length > 0) {
+        order.forEach(p => openProject(p));
+        return;
+      }
+      const last = await settings.get('last_project');
+      if (last) openProject(last);
+    });
   }, []);
 
   const refreshGit = useCallback(() => {
@@ -435,7 +431,7 @@ function App() {
   }, [updateWs]);
 
   useEffect(() => {
-    localStorage.setItem('pill_breakpoints', JSON.stringify(breakpoints));
+    settings.set('breakpoints', breakpoints);
   }, [breakpoints]);
 
   const [debugTermTabRef] = useState(() => ({ current: null }));
@@ -634,23 +630,19 @@ function App() {
       if (!e.ctrlKey || (e.key !== 'v' && e.key !== 'V')) return;
       const el = e.target;
       if (!el || !container.contains(el)) return;
+      const session = projTerms[tabId];
+      if (!session?.sessionId) return;
+      if (session.hasTTY) return;
       e.preventDefault();
       e.stopPropagation();
       setTimeout(() => {
         invoke('plugin:clipboard-manager|read_text')
           .then(text => {
             if (!text) return;
-            const session = projTerms[tabId];
-            if (!session?.sessionId) return;
             const normalized = text.replace(/\r\n/g, '\n');
-            if (session.hasTTY) {
-              const formatted = normalized.replace(/\n/g, '\r\n');
-              invoke('write_terminal', { sessionId: session.sessionId, data: formatted }).catch(() => {});
-            } else {
-              const displayText = normalized.replace(/\n/g, '\r\n');
-              try { term.write(displayText); } catch {}
-              invoke('write_terminal', { sessionId: session.sessionId, data: normalized }).catch(() => {});
-            }
+            const displayText = normalized.replace(/\n/g, '\r\n');
+            try { term.write(displayText); } catch {}
+            invoke('write_terminal', { sessionId: session.sessionId, data: normalized }).catch(() => {});
           })
           .catch(() => {});
       }, 10);
@@ -880,7 +872,7 @@ function App() {
                     <span className="text-[10px] font-mono text-gray-500">{editorFontSize}px</span>
                   </div>
                   <input type="range" min="10" max="24" value={editorFontSize}
-                    onChange={e => { const v = parseInt(e.target.value, 10); setEditorFontSize(v); localStorage.setItem('pill_font_size', String(v)); }}
+                    onChange={e => { const v = parseInt(e.target.value, 10); setEditorFontSize(v); settings.set('editor_font_size', v); }}
                     className="w-full h-1 rounded-full appearance-none bg-gray-700 cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-gray-300" />
                 </div>
                 <div className="px-3 py-1 text-[7px] font-bold uppercase tracking-[0.2em] text-gray-600">Consola</div>
@@ -890,7 +882,7 @@ function App() {
                     <span className="text-[10px] font-mono text-gray-500">{consoleFontSize}px</span>
                   </div>
                   <input type="range" min="8" max="24" value={consoleFontSize}
-                    onChange={e => { const v = parseInt(e.target.value, 10); setConsoleFontSize(v); localStorage.setItem('pill_console_font_size', String(v)); }}
+                    onChange={e => { const v = parseInt(e.target.value, 10); setConsoleFontSize(v); settings.set('console_font_size', v); }}
                     className="w-full h-1 rounded-full appearance-none bg-gray-700 cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-gray-300" />
                 </div>
               </div>
@@ -1210,8 +1202,8 @@ function App() {
                   ) : (
                     <DebugPanel sessionId={ws.debugSessionId} vars={ws.debugVars} stack={ws.debugStack} location={ws.debugLocation} onCmd={debugSendCmd}
                       debugPort={debugPort} debugSuspend={debugSuspend}
-                      onToggleSuspend={() => { const v = !debugSuspend; setDebugSuspend(v); localStorage.setItem('pill_debug_suspend', v ? 'y' : 'n'); }}
-                      onPortChange={v => { setDebugPort(v); localStorage.setItem('pill_debug_port', String(v)); }} />
+                      onToggleSuspend={() => { const v = !debugSuspend; setDebugSuspend(v); settings.set('debug_suspend', v); }}
+                      onPortChange={v => { setDebugPort(v); settings.set('debug_port', v); }} />
                   )}
                 </div>
               </div>

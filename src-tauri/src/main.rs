@@ -3278,6 +3278,7 @@ fn main() {
     .plugin(tauri_plugin_shell::init())
     .plugin(tauri_plugin_dialog::init())
     .plugin(tauri_plugin_clipboard_manager::init())
+    .plugin(tauri_plugin_store::Builder::default().build())
       .setup(|app| {
         // Each terminal tab gets its own pipe-based PowerShell process.
         // For TTY-dependent tools like codex, use winpty (install via UI).
