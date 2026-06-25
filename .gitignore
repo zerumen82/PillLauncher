@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+dist/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs_*.txt
+
+# Generated icon files (regenerated via gen-icon.ps1)
+src-tauri/icons/*
+!src-tauri/icons/.gitkeep
+icon-source.png
+app-icon.png
+
+# Tauri build
+src-tauri/target/
+
+# Generated builds
+build/
+
+# Test files
+test_conpty*.rs
+test_conpty*.exe
+test_conpty*.pdb
+tests/
+
+# Cargo config override
+src-tauri/.cargo/
+
+# Environment
+.env
+.env.local

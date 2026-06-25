@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "ATL Launcher capabilities",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "clipboard-manager:allow-read-text",
+    "clipboard-manager:allow-write-text",
+    "fs:allow-read",
+    "fs:allow-read-dir",
+    "fs:allow-read-file",
+    "fs:read-all",
+    "dialog:allow-open",
+    "dialog:allow-message",
+    "shell:allow-execute",
+    "shell:allow-open",
+    "shell:allow-spawn"
+  ]
+}

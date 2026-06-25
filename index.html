@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PillLauncher</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+  </head>
+  <body>
+    <div id="root"><p style="color:#f87171;padding:20px;font-family:monospace;font-size:13px">Loading...</p></div>
+    <script>console.log('!inline-script-ok'); document.title = 'PillLauncher (inline)'; document.getElementById('root').innerHTML = '<p style="color:red;padding:20px;font-family:monospace">HTML loaded, waiting for React...</p>';</script>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
