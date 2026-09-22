@@ -3,6 +3,9 @@ import tailwindcss from "@tailwindcss/vite";
 
 export default defineConfig({
   plugins: [tailwindcss()],
+  esbuild: {
+    jsx: 'automatic',
+  },
   clearScreen: false,
   build: {
     modulePreload: false,
