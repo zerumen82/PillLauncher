@@ -1,15 +1,7 @@
-import React from 'react';
-
-const FolderOpenIcon = () => (
-  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-  </svg>
-);
-
 export default function ProjectTabs({ projects, activeProject, onSwitch, onClose, onAdd, runningProject }) {
   return (
     <div className="flex items-center gap-0.5 px-3 py-1 bg-[#0e1018] border-b border-white/[0.04] overflow-x-auto shrink-0">
-      {projects.map((p, i) => {
+      {projects.map((p) => {
         const isActive = p.path === activeProject;
         const isRunning = runningProject === p.path;
         const label = p.label || p.path.split(/[\\/]/).pop() || 'Proyecto';

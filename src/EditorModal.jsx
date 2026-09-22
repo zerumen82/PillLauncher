@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import Editor, { loader } from '@monaco-editor/react';
 import * as monaco from 'monaco-editor';
@@ -33,7 +33,7 @@ function flattenOutline(items, depth = 0) {
   return result;
 }
 
-export default function EditorModal({ path, line, col, onClose, panel, initialContent, readOnly, fontSize, breakpoints, onToggleBreakpoint }) {
+export default function EditorModal({ path, line, onClose, panel, initialContent, readOnly, fontSize, breakpoints, onToggleBreakpoint }) {
   const isDiff = !!initialContent;
   const [fileInfo, setFileInfo] = useState(null);
   const [loading, setLoading] = useState(!isDiff);
@@ -43,8 +43,6 @@ export default function EditorModal({ path, line, col, onClose, panel, initialCo
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const saveTimer = useRef(null);
-  const [monacoReady, setMonacoReady] = useState(false);
-  const [monacoFailed, setMonacoFailed] = useState(false);
   const editorRef = useRef(null);
   const monacoRef = useRef(null);
   const editorContainerRef = useRef(null);
@@ -84,8 +82,6 @@ export default function EditorModal({ path, line, col, onClose, panel, initialCo
   const handleEditorDidMount = (editor, m) => {
     editorRef.current = editor;
     monacoRef.current = m;
-    setMonacoReady(true);
-    setMonacoFailed(false);
     if (line) {
       editor.revealLineInCenter(line);
       editor.setSelection(new m.Range(line, 1, line, 1));
@@ -147,33 +143,25 @@ export default function EditorModal({ path, line, col, onClose, panel, initialCo
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
   }, [editorContent, modified, isDiff, doSave]);
 
-  const handleSave = async () => {
-    if (isDiff) return;
-    setSaving(true);
-    try {
-      await invoke('save_file', { path, content: editorContent });
-      setModified(false);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
-    } catch (e) {
-      setError(String(e));
-    }
-    setSaving(false);
-  };
+  const lastSearchClearRef = useRef(0);
 
   const handleKeyDown = (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === 's') {
       e.preventDefault();
-      handleSave();
+      doSave();
     }
     if (e.key === 'Escape' && searchTerm) {
       e.preventDefault();
       setSearchTerm('');
       setSearchMatches([]);
       if (decorationRef.current) { decorationRef.current.clear(); decorationRef.current = null; }
+      lastSearchClearRef.current = Date.now();
       return;
     }
-    if (e.key === 'Escape') onClose();
+    if (e.key === 'Escape') {
+      if (Date.now() - lastSearchClearRef.current < 300) return;
+      onClose();
+    }
   };
 
   useEffect(() => {

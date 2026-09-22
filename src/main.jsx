@@ -8,6 +8,9 @@ import { Group, Panel, Separator } from 'react-resizable-panels';
 import FileTree from './FileTree.jsx';
 import { listen } from '@tauri-apps/api/event';
 import { Terminal } from '@xterm/xterm';
+import { readText, writeText } from '@tauri-apps/plugin-clipboard-manager';
+import { openInExplorer, baseName, joinPath, relativeTo } from './openInExplorer.js';
+import { check } from '@tauri-apps/plugin-updater';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import './index.css';
@@ -46,7 +49,7 @@ function shortPath(p) {
   return `${parts[0]}\\…\\${parts.at(-2)}\\${parts.at(-1)}`;
 }
 
-const FILE_LINE_RE = /((?:[A-Za-z]:[\\/])?(?:\.{1,2}[\\/])?(?:\w[\w.\-]*[\\/])*\w[\w.\-]*\.\w+):(\d+)(?::(\d+))?/g;
+const FILE_LINE_RE = /((?:[A-Za-z]:[\\/])?(?:\.{1,2}[\\/])?(?:\w[\w.-]*[\\/])*\w[\w.-]*\.\w+):(\d+)(?::(\d+))?/g;
 
 function splitLogLine(text, openFn) {
   if (!text) return [{ type: 'text', text: '' }];
@@ -75,16 +78,6 @@ const PlayIcon = () => (
     <polygon points="5 3 19 12 5 21 5 3" />
   </svg>
 );
-const CleanIcon = () => (
-  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-    <polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-  </svg>
-);
-const TestIcon = () => (
-  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-    <path d="M9 11l3 3L22 4" /><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
-  </svg>
-);
 const BuildIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
     <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
@@ -103,7 +96,7 @@ function makeWorkspace(path) {
     gitBranches: null,
     gitWorking: false,
     commitMsg: '',
-    gitOpenCards: { staged: true, changes: true },
+    gitOpenCards: { staged: true, changes: true, history: false },
     consoleTabs: [{ id: 'consola', label: 'Consola' }],
     activeConsoleTab: 'consola',
     debugSessionId: null,
@@ -157,7 +150,7 @@ function App() {
   const allCmdRef = useRef(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
-  const [searching, setSearching] = useState(false);
+  const [, setSearching] = useState(false);
   const searchRef = useRef(null);
   const [recentProjects, setRecentProjects] = useState([]);
   const [showRecent, setShowRecent] = useState(false);
@@ -173,18 +166,79 @@ function App() {
   const [consoleFontSize, setConsoleFontSize] = useState(11);
   const [toast, setToast] = useState(null);
   const [isGitHubRemote, setIsGitHubRemote] = useState(false);
+  const [compactTerminal, setCompactTerminal] = useState(true);
+  const [, setMaxLogLines] = useState(500);
+  const [gitLog, setGitLog] = useState([]);
+  const [showShortcuts, setShowShortcuts] = useState(false);
+  const [newItemName, setNewItemName] = useState('');
+  const [newItemType, setNewItemType] = useState(null); // 'file' | 'folder' | null
+  const [, setMaxLineLength] = useState(300);
+  const maxLogLinesRef = useRef(500);
+  const maxLineLengthRef = useRef(300);
+
+  const saveProjectState = useCallback(() => {
+    const state = {};
+    for (const [path, proj] of Object.entries(projects)) {
+      state[path] = {
+        editorFiles: proj.editorFiles,
+        activeFileIdx: proj.activeFileIdx,
+        consoleTabs: proj.consoleTabs,
+        activeConsoleTab: proj.activeConsoleTab,
+        sidebarOpen: proj.sidebarOpen,
+        explorerTab: proj.explorerTab,
+      };
+    }
+    settings.set('saved_project_state', state);
+  }, [projects]);
+
+  const restoreProjectState = useCallback(async () => {
+    const saved = await settings.get('saved_project_state');
+    if (!saved || typeof saved !== 'object') return;
+    for (const [path, state] of Object.entries(saved)) {
+      if (!projects[path]) continue;
+      updateWs(path, {
+        editorFiles: state.editorFiles || [],
+        activeFileIdx: typeof state.activeFileIdx === 'number' ? state.activeFileIdx : -1,
+        consoleTabs: state.consoleTabs || [{ id: 'consola', label: 'Consola' }],
+        activeConsoleTab: state.activeConsoleTab || 'consola',
+        sidebarOpen: state.sidebarOpen !== false,
+        explorerTab: state.explorerTab || 'files',
+      });
+    }
+  }, [projects, updateWs]);
+
+  const collapseRepeated = (arr) => {
+    if (!compactTerminal || !arr?.length) return arr || [];
+    const maxLen = maxLineLengthRef.current || 300;
+    const result = [];
+    let repeatCount = 0;
+    for (let i = 0; i < arr.length; i++) {
+      const text = arr[i].text;
+      const truncated = text.length > maxLen ? text.slice(0, Math.floor(maxLen * 0.6)) + `… (${text.length - Math.floor(maxLen * 0.6)} más)` : text;
+      if (i > 0 && arr[i].text === arr[i-1].text && arr[i].kind === arr[i-1].kind) {
+        repeatCount++;
+        if (repeatCount === 1 || repeatCount === 10 || repeatCount === 50 || repeatCount === 100 || repeatCount % 200 === 0) {
+          result[result.length - 1] = { text: `${truncated} (×${repeatCount + 1})`, kind: arr[i].kind, t: arr[i].t };
+        }
+      } else {
+        repeatCount = 0;
+        result.push({ ...arr[i], text: truncated });
+      }
+    }
+    return result;
+  };
 
   const filteredLogs = consoleSearch
     ? (logs || []).filter(l => l?.text && l.text.toLowerCase().includes(consoleSearch.toLowerCase()))
-    : (logs || []);
+    : collapseRepeated(logs || []);
 
   const gitStaged = ws?.gitEntries ? ws.gitEntries.filter(([s]) => {
-    const x = s[0], y = s[1];
-    return (x !== ' ' && x !== '?' && x !== '!') || (x !== ' ' && y !== ' ' && x !== '?');
+    const x = s[0];
+    return x !== ' ' && x !== '?';
   }) : [];
   const gitUnstaged = ws?.gitEntries ? ws.gitEntries.filter(([s]) => {
-    const x = s[0], y = s[1];
-    return s === '??' || s === '!!' || (y !== ' ' && y !== '?') || (x === ' ' && y !== ' ');
+    const y = s[1];
+    return s === '??' || s === '!!' || y !== ' ' && y !== '?';
   }) : [];
   const gitModified = gitUnstaged.filter(([s]) => s !== '??' && s !== '!!');
   const gitUntracked = gitUnstaged.filter(([s]) => s === '??' || s === '!!');
@@ -198,10 +252,23 @@ function App() {
       setBreakpoints(s.breakpoints);
       setEditorFontSize(s.editor_font_size);
       setConsoleFontSize(s.console_font_size);
+      setCompactTerminal(s.compact_terminal !== false);
+      const ml = s.max_log_lines || 500;
+      const mll = s.max_line_length || 300;
+      setMaxLogLines(ml);
+      setMaxLineLength(mll);
+      maxLogLinesRef.current = ml;
+      maxLineLengthRef.current = mll;
     });
   }, []);
 
-  const addLog = useCallback((text, kind = 'stdout') => setLogs(prev => [...prev, { text, kind, t: Date.now() }]), []);
+  const addLog = useCallback((text, kind = 'stdout') => setLogs(prev => {
+    const maxLen = maxLineLengthRef.current || 300;
+    const trimmed = text.length > maxLen ? text.slice(0, maxLen) + '…' : text;
+    const next = [...prev, { text: trimmed, kind, t: Date.now() }];
+    const maxLines = maxLogLinesRef.current || 500;
+    return next.length > maxLines ? next.slice(-maxLines) : next;
+  }), []);
   const clearLogs = useCallback(() => setLogs([]), []);
 
   const doSearch = useCallback(async (q) => {
@@ -279,17 +346,39 @@ function App() {
     if (!sel) return;
     if (projects[sel]) { setActiveProject(sel); return; }
     const newWs = makeWorkspace(sel);
+    invoke('register_root', { path: sel }).catch(e => console.warn('register_root:', e));
     setProjects(prev => ({ ...prev, [sel]: newWs }));
     setProjectOrder(prev => [...prev.filter(p => p !== sel), sel]);
     setActiveProject(sel);
     addRecent(sel);
     settings.set('last_project', sel);
     setShowRecent(false);
-    addLog(`Abriendo proyecto: ${sel}`, 'dim');
+    addLog(`Abriendo carpeta: ${sel}`, 'dim');
     try {
       const r = await invoke('detect_project', { path: sel });
       updateWs(sel, { info: r, activeMode: r.modes[0]?.id || '' });
-    } catch (e) { addLog(String(e), 'err'); }
+      invoke('git_pull', { path: sel }).then(out => {
+        if (out && !out.includes('Already up to date')) addLog(`git pull: ${out}`, 'dim');
+      }).catch(e => addLog(`git pull: ${e}`, 'err'));
+    } catch (e) {
+      addLog(`Carpeta sin estructura de proyecto conocida — modo terminal activo`, 'info');
+      const fallback = {
+        path: sel,
+        typ: 'folder',
+        label: sel.split(/[\\/]/).pop() || 'Carpeta',
+        emoji: '📁',
+        color: '#6b7280',
+        version: '',
+        modes: [],
+        profiles: [],
+        gradle_tasks: [],
+        build_cmd: '',
+        clean_cmd: '',
+        run_cmd: '',
+        test_cmd: '',
+      };
+      updateWs(sel, { info: fallback, activeMode: '' });
+    }
     if (!activeProjectRef.current) setActiveProject(sel);
   }, [projects, addLog, addRecent, updateWs]);
 
@@ -297,10 +386,9 @@ function App() {
     const termProj = terminalRefs.current[path];
     if (termProj) {
       Object.values(termProj).forEach(session => {
-        session.unlistenFn?.();
-        session.resizeObserver?.disconnect();
+        session.dispose?.();
         if (session.term) { try { session.term.dispose(); } catch {} }
-        if (session.sessionId) invoke('stop_terminal', { sessionId: session.sessionId }).catch(() => {});
+        if (session.sessionId) invoke('stop_terminal', { sessionId: session.sessionId }).catch(e => console.warn('stop_terminal:', e));
       });
       delete terminalRefs.current[path];
     }
@@ -358,6 +446,7 @@ function App() {
       const isGitHub = url.includes('github.com');
       setIsGitHubRemote(isGitHub);
     }).catch(() => setIsGitHubRemote(false));
+    invoke('git_log', { path: proj, count: 30 }).then(r => setGitLog(r)).catch(() => setGitLog([]));
   }, [updateWs]);
 
   const showToast = useCallback((message, type = 'ok') => {
@@ -391,7 +480,6 @@ function App() {
     const proj = activeProjectRef.current;
     if (!proj) return;
     const prev = wsRef.current;
-    const counter = prev?.termCounter || 0;
     termCounterRef.current++;
     const tabId = `term_${Date.now()}`;
     const displayLabel = label || `Term ${termCounterRef.current}`;
@@ -408,8 +496,6 @@ function App() {
     return tabId;
   }, [addLog, updateWs]);
 
-  const termCounterRef = useRef(0);
-
   const closeTerminal = useCallback((tabId) => {
     const proj = activeProjectRef.current;
     if (!proj) return;
@@ -417,10 +503,9 @@ function App() {
     if (projTerms) {
       const session = projTerms[tabId];
       if (session) {
-        session.unlistenFn?.();
-        session.resizeObserver?.disconnect();
+        session.dispose?.();
         if (session.term) { try { session.term.dispose(); } catch {} }
-        if (session.sessionId) invoke('stop_terminal', { sessionId: session.sessionId }).catch(() => {});
+        if (session.sessionId) invoke('stop_terminal', { sessionId: session.sessionId }).catch(e => console.warn('stop_terminal:', e));
         delete projTerms[tabId];
       }
     }
@@ -434,7 +519,39 @@ function App() {
     settings.set('breakpoints', breakpoints);
   }, [breakpoints]);
 
-  const [debugTermTabRef] = useState(() => ({ current: null }));
+  useEffect(() => {
+    const handler = () => saveProjectState();
+    window.addEventListener('beforeunload', handler);
+    let unlistenClose;
+    listen('tauri://close-requested', () => {
+      saveProjectState();
+    }).then(fn => { unlistenClose = fn; });
+    let unlistenUpdate;
+    listen('tauri://update-available', () => {
+      saveProjectState();
+    }).then(fn => { unlistenUpdate = fn; });
+    return () => {
+      saveProjectState();
+      window.removeEventListener('beforeunload', handler);
+      unlistenClose?.();
+      unlistenUpdate?.();
+    };
+  }, [saveProjectState]);
+
+  const projectCount = Object.keys(projects).length;
+  useEffect(() => {
+    if (projectCount > 0) {
+      restoreProjectState();
+    }
+  }, [projectCount]);
+
+  useEffect(() => {
+    settings.get('compact_terminal').then(v => {
+      if (typeof v === 'boolean') setCompactTerminal(v);
+    });
+  }, []);
+
+  const termCounterRef = useRef(0);
 
   const toggleBreakpoint = useCallback(async (filePath, line) => {
     const proj = activeProjectRef.current;
@@ -453,13 +570,15 @@ function App() {
       try {
         const cls = await invoke('resolve_bp_class', { path: filePath });
         if (isNowSet) {
-          invoke('debug_cmd', { sessionId: currentWs.debugSessionId, cmd: `stop at ${cls}:${line}` }).catch(() => {});
+          invoke('debug_cmd', { sessionId: currentWs.debugSessionId, cmd: `stop at ${cls}:${line}` })
+            .catch(e => addLog(`jdb: ${e}`, 'err'));
         } else {
-          invoke('debug_cmd', { sessionId: currentWs.debugSessionId, cmd: `clear ${cls}:${line}` }).catch(() => {});
+          invoke('debug_cmd', { sessionId: currentWs.debugSessionId, cmd: `clear ${cls}:${line}` })
+            .catch(e => addLog(`jdb: ${e}`, 'err'));
         }
-      } catch {}
+      } catch (e) { addLog(String(e), 'err'); }
     }
-  }, [breakpoints]);
+  }, [breakpoints, addLog]);
 
   useEffect(() => {
     const handler = (e) => {
@@ -495,14 +614,15 @@ function App() {
     const unlisten = listen('terminal-exited', (e) => {
       const { id } = e.payload;
       for (const [projPath, projTerms] of Object.entries(terminalRefs.current)) {
-        if (projTerms[id]) {
-          projTerms[id].unlistenFn?.();
-          projTerms[id].resizeObserver?.disconnect();
-          if (projTerms[id].term) { try { projTerms[id].term.dispose(); } catch {} }
-          delete projTerms[id];
+        const entry = Object.entries(projTerms).find(([, session]) => session.sessionId === id);
+        if (entry) {
+          const [tabId, session] = entry;
+          session.dispose?.();
+          if (session.term) { try { session.term.dispose(); } catch {} }
+          delete projTerms[tabId];
           updateWs(projPath, prev => ({
-            consoleTabs: prev.consoleTabs.filter(t => t.id !== id),
-            activeConsoleTab: prev.activeConsoleTab === id ? 'consola' : prev.activeConsoleTab,
+            consoleTabs: prev.consoleTabs.filter(t => t.id !== tabId),
+            activeConsoleTab: prev.activeConsoleTab === tabId ? 'consola' : prev.activeConsoleTab,
           }));
           break;
         }
@@ -514,12 +634,11 @@ function App() {
   // ── Clean up terminals when a project is removed ──
   useEffect(() => {
     return () => {
-      Object.entries(terminalRefs.current).forEach(([projPath, projTerms]) => {
+      Object.entries(terminalRefs.current).forEach(([_projPath, projTerms]) => {
         Object.values(projTerms).forEach(session => {
-          session.unlistenFn?.();
-          session.resizeObserver?.disconnect();
+          session.dispose?.();
           if (session.term) { try { session.term.dispose(); } catch {} }
-          if (session.sessionId) invoke('stop_terminal', { sessionId: session.sessionId }).catch(() => {});
+          if (session.sessionId) invoke('stop_terminal', { sessionId: session.sessionId }).catch(e => console.warn('stop_terminal:', e));
         });
       });
     };
@@ -536,6 +655,10 @@ function App() {
     const existing = projTerms[tabId];
     if (existing && existing.term) {
       try { existing.fitAddon?.fit(); } catch {}
+      const d = existing.fitAddon?.proposeDimensions();
+      if (d && d.cols > 0 && d.rows > 0 && existing.sessionId) {
+        invoke('set_terminal_size', { sessionId: existing.sessionId, cols: d.cols, rows: d.rows }).catch(e => console.warn('set_terminal_size:', e));
+      }
       return;
     }
     const container = document.getElementById(`xterm-${projPath}-${tabId}`);
@@ -549,7 +672,11 @@ function App() {
     });
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
-    projTerms[tabId] = { term, fitAddon, sessionId: null, unlistenFn: null, resizeObserver: null };
+    const session = {
+      term, fitAddon, sessionId: null, hasTTY: false, outputUnlisten: null,
+      resizeObserver: null, inputDisposable: null, dispose: null, disposed: false,
+    };
+    projTerms[tabId] = session;
     term.open(container);
     try { fitAddon.fit(); } catch {}
     const getDims = () => {
@@ -559,94 +686,127 @@ function App() {
     const sendSize = () => {
       const dims = getDims();
       if (!dims) return;
-      const s = projTerms[tabId];
-      if (s?.sessionId) {
-        invoke('set_terminal_size', { sessionId: s.sessionId, cols: dims.cols, rows: dims.rows }).catch(() => {});
-      }
-    };
+        if (session.sessionId && !session.disposed) {
+          invoke('set_terminal_size', { sessionId: session.sessionId, cols: dims.cols, rows: dims.rows }).catch(e => console.warn('set_terminal_size:', e));
+        }
+      };
     const initDims = getDims() || { cols: 80, rows: 24 };
-    const pendingIdRef = { current: null };
+
+    // Terminal output listener — buffer until sessionId is set, then route
     const outputBuffer = [];
-    const unlistenPromise = listen('terminal-output', (e) => {
-      const targetId = pendingIdRef.current;
-      if (targetId) {
-        if (e.payload.id === targetId) {
+    listen('terminal-output', (e) => {
+      if (session.disposed || projTerms[tabId] !== session) return;
+      if (session.sessionId) {
+        if (e.payload.id === session.sessionId) {
           try { term.write(e.payload.data); } catch {}
         }
       } else {
         outputBuffer.push(e);
       }
+    }).then(fn => {
+      if (session.disposed || projTerms[tabId] !== session) {
+        fn();
+        return;
+      }
+      session.outputUnlisten = fn;
+      // Do not start the child process until its event listener is ready.
+      // Otherwise a fast shell prompt is emitted before xterm can receive it.
+      startSession();
     });
-    invoke('start_terminal', { path: projPath, cols: initDims.cols, rows: initDims.rows })
-      .then(result => {
-        const session = projTerms[tabId];
-        if (!session) return;
-        session.sessionId = result.id;
-        session.hasTTY = result.has_tty;
-        pendingIdRef.current = result.id;
-        for (const e of outputBuffer) {
-          if (e.payload.id === result.id) {
-            try { term.write(e.payload.data); } catch {}
-          }
-        }
-        outputBuffer.length = 0;
-        sendSize();
-        unlistenPromise.then(fn => { session.unlistenFn = fn; });
-        if (!result.has_tty) {
-          try { term.write('\r\nWindows PowerShell (pipe mode)\r\nPS> '); } catch {}
-        }
-      })
-      .catch(e => {
-        unlistenPromise.then(fn => fn());
-        term.writeln(`\r\n[Error: ${e}]\r\n`);
-      });
-    term.onData(data => {
-      const session = projTerms[tabId];
-      if (!session?.sessionId) return;
+
+    // Start the terminal session
+    let started = false;
+    const startSession = (retryDelay = 0) => {
+      setTimeout(() => {
+        if (session.disposed || projTerms[tabId] !== session) return;
+        invoke('start_terminal', { path: projPath, cols: initDims.cols, rows: initDims.rows })
+          .then(result => {
+            if (started) return;
+            started = true;
+            if (session.disposed || projTerms[tabId] !== session) {
+              invoke('stop_terminal', { sessionId: result.id }).catch(e => console.warn('stop_terminal:', e));
+              return;
+            }
+            session.sessionId = result.id;
+            session.hasTTY = result.has_tty;
+            // Flush buffered output
+            for (const e of outputBuffer) {
+              if (e.payload.id === result.id) {
+                try { term.write(e.payload.data); } catch {}
+              }
+            }
+            outputBuffer.length = 0;
+            sendSize();
+            if (!result.has_tty) {
+              try { term.write('\r\nPowerShell (piped)\r\n'); } catch {}
+            }
+          })
+          .catch(e => {
+            if (!started) term.writeln(`\r\n[Terminal error: ${e}]\r\n`);
+            if (!started && retryDelay < 3) {
+              startSession(retryDelay + 1);
+            }
+          });
+      }, retryDelay * 1500);
+    };
+    // Forward keystrokes to backend + local echo for pipe mode
+    session.inputDisposable = term.onData(data => {
+      if (session.disposed || !session.sessionId) return;
+      const isEnter = data === '\r' || data === '\n';
       if (session.hasTTY) {
-        invoke('write_terminal', { sessionId: session.sessionId, data }).catch(() => {});
+        invoke('write_terminal', { sessionId: session.sessionId, data: isEnter ? '\r' : data })
+          .catch(e => { try { term.write(`\r\n[write error: ${e}]\r\n`); } catch {} });
       } else {
-        if (!session.inputBuffer) session.inputBuffer = '';
-        if (data === '\x7f' || data === '\x08') {
-          if (session.inputBuffer.length > 0) {
-            session.inputBuffer = session.inputBuffer.slice(0, -1);
-            try { term.write('\b \b'); } catch {}
-          }
-        } else if (data === '\r' || data === '\n') {
-          const rawLine = session.inputBuffer;
-          session.inputBuffer = '';
+        invoke('write_terminal', { sessionId: session.sessionId, data })
+          .catch(e => { try { term.write(`\r\n[write error: ${e}]\r\n`); } catch {} });
+        if (isEnter) {
           try { term.write('\r\n'); } catch {}
-          const line = (!session.hasTTY && /^codex\b/.test(rawLine.trim()))
-            ? 'winpty ' + rawLine
-            : rawLine;
-          invoke('write_terminal', { sessionId: session.sessionId, data: line + '\r' }).catch(() => {});
+        } else if (data === '\x7f' || data === '\x08') {
+          try { term.write('\b \b'); } catch {}
         } else {
-          session.inputBuffer += data;
           try { term.write(data); } catch {}
         }
       }
     });
-    document.addEventListener('keydown', (e) => {
-      if (!e.ctrlKey || (e.key !== 'v' && e.key !== 'V')) return;
-      const el = e.target;
-      if (!el || !container.contains(el)) return;
-      const session = projTerms[tabId];
-      if (!session?.sessionId) return;
-      if (session.hasTTY) return;
-      e.preventDefault();
-      e.stopPropagation();
-      setTimeout(() => {
-        invoke('plugin:clipboard-manager|read_text')
-          .then(text => {
-            if (!text) return;
-            const normalized = text.replace(/\r\n/g, '\n');
-            const displayText = normalized.replace(/\n/g, '\r\n');
-            try { term.write(displayText); } catch {}
-            invoke('write_terminal', { sessionId: session.sessionId, data: normalized }).catch(() => {});
-          })
-          .catch(() => {});
-      }, 10);
-    }, { capture: true });
+
+    // Paste handler: Ctrl+V → clipboard → backend (all modes)
+    const onKeyDown = async (e) => {
+      if (!container.contains(e.target)) return;
+      if (session.disposed || !session.sessionId) return;
+      if (e.ctrlKey && (e.key === 'v' || e.key === 'V')) {
+        e.preventDefault();
+        e.stopPropagation();
+        try {
+          const raw = await readText();
+          if (!raw) return;
+          const normalized = raw.replace(/\r\n/g, '\n');
+          if (session.term) {
+            try { session.term.paste(normalized); } catch { session.term.write(normalized.replace(/\n/g, '\r\n')); }
+          }
+          invoke('write_terminal', { sessionId: session.sessionId, data: normalized })
+            .catch(e => { try { session.term.write(`\r\n[write error: ${e}]\r\n`); } catch {} });
+        } catch (e) { console.warn('paste failed:', e); }
+        return;
+      }
+      if (e.ctrlKey && (e.key === 'c' || e.key === 'C')) {
+        const sel = session.term?.getSelection();
+        if (sel) {
+          e.preventDefault();
+          e.stopPropagation();
+          try { writeText(sel); } catch {}
+          session.term?.clearSelection();
+          return;
+        }
+        // No selection — send SIGINT (Ctrl+C) to terminal process
+        e.preventDefault();
+        e.stopPropagation();
+        invoke('write_terminal', { sessionId: session.sessionId, data: '\x03' })
+          .catch(e => { try { session.term.write(`\r\n[write error: ${e}]\r\n`); } catch {} });
+        return;
+      }
+    };
+    document.addEventListener('keydown', onKeyDown, { capture: true });
+
     let resizeTimer;
     const resizeObserver = new ResizeObserver(() => {
       clearTimeout(resizeTimer);
@@ -656,7 +816,23 @@ function App() {
       }, 100);
     });
     resizeObserver.observe(container);
-    projTerms[tabId].resizeObserver = resizeObserver;
+    session.resizeObserver = resizeObserver;
+    session.dispose = () => {
+      if (session.disposed) return;
+      session.disposed = true;
+      document.removeEventListener('keydown', onKeyDown, { capture: true });
+      session.inputDisposable?.dispose();
+      session.outputUnlisten?.();
+      resizeObserver.disconnect();
+      clearTimeout(resizeTimer);
+    };
+
+    // A terminal session may remain open while its tab is hidden.  Its event
+    // handlers must therefore outlive this effect and are released by
+    // session.dispose() only when the tab/project is actually closed.
+    return () => {
+      // Intentionally empty: changing terminalKey must not disconnect a live terminal.
+    };
   }, [terminalKey]);
 
   // ── Live update terminal font size ──
@@ -710,7 +886,7 @@ function App() {
     return () => { unlisten.then(fn => fn()); };
   }, [updateWs]);
 
-  const applyBreakpoints = useCallback(async (tabId) => {
+  const _applyBreakpoints = useCallback(async (tabId) => {
     const proj = activeProjectRef.current;
     if (!proj) return;
     const projTerms = terminalRefs.current[proj];
@@ -721,11 +897,12 @@ function App() {
       for (const line of lines) {
         try {
           const cls = await invoke('resolve_bp_class', { path: filePath });
-          invoke('write_terminal', { sessionId: session.sessionId, data: `stop at ${cls}:${line}\r\n` }).catch(() => {});
-        } catch {}
+          invoke('write_terminal', { sessionId: session.sessionId, data: `stop at ${cls}:${line}\r\n` })
+            .catch(e => addLog(String(e), 'err'));
+        } catch (e) { addLog(String(e), 'err'); }
       }
     }
-  }, [breakpoints]);
+  }, [breakpoints, addLog]);
 
   const debugSendCmd = useCallback(async (cmd) => {
     const proj = activeProjectRef.current;
@@ -737,8 +914,8 @@ function App() {
     try { await invoke('debug_cmd', { sessionId: currentWs.debugSessionId, cmd }); } catch (e) { addLog(`jdb error: ${e}`, 'err'); }
     if (['step', 'next', 'step up', 'cont'].includes(cmd)) {
       setTimeout(() => {
-        invoke('debug_cmd', { sessionId: currentWs.debugSessionId, cmd: 'locals' }).catch(() => {});
-        invoke('debug_cmd', { sessionId: currentWs.debugSessionId, cmd: 'where' }).catch(() => {});
+        invoke('debug_cmd', { sessionId: currentWs.debugSessionId, cmd: 'locals' }).catch(e => addLog(`jdb: ${e}`, 'err'));
+        invoke('debug_cmd', { sessionId: currentWs.debugSessionId, cmd: 'where' }).catch(e => addLog(`jdb: ${e}`, 'err'));
       }, 100);
     }
   }, [addLog, updateWs]);
@@ -758,8 +935,8 @@ function App() {
         for (const [fp, lines] of Object.entries(breakpoints).filter(([, ls]) => ls?.length)) {
           for (const ln of lines) {
             invoke('resolve_bp_class', { path: fp }).then(cls => {
-              invoke('debug_cmd', { sessionId: id, cmd: `stop at ${cls}:${ln}` }).catch(() => {});
-            }).catch(() => {});
+              invoke('debug_cmd', { sessionId: id, cmd: `stop at ${cls}:${ln}` }).catch(e => addLog(`jdb: ${e}`, 'err'));
+            }).catch(e => addLog(String(e), 'err'));
           }
         }
         updateWs(proj, { explorerTab: 'debug' });
@@ -783,11 +960,19 @@ function App() {
     refreshGit();
   }, [activeProject]);
 
-  const isMaven  = ws?.info?.typ === 'maven';
-  const isGradle = ws?.info?.typ === 'gradle';
-  const isJava   = ws?.info?.typ === 'java';
-  const isCMake  = ws?.info?.typ === 'cmake';
-  const isMake   = ws?.info?.typ === 'make';
+  // ── Auto-refresh git status every 5s ──
+  useEffect(() => {
+    if (!activeProject) return;
+    const interval = setInterval(() => {
+      const proj = activeProjectRef.current;
+      if (!proj) return;
+      refreshGit();
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [activeProject]);
+
+  // ── Closed editor tabs stack for Ctrl+Shift+T ──
+  const closedTabsRef = useRef([]);
 
   useEffect(() => {
     const handler = (e) => {
@@ -798,22 +983,56 @@ function App() {
         if ((ws?.activeFileIdx ?? -1) < 0) { e.preventDefault(); document.querySelector('[placeholder="Ctrl+F"]')?.focus(); return; }
         return;
       }
+      // Ctrl+W — close current editor tab
+      if ((e.ctrlKey || e.metaKey) && e.key === 'w') {
+        if (ws?.editorFiles?.length > 0 && ws.activeFileIdx >= 0) {
+          e.preventDefault();
+          const closed = ws.editorFiles[ws.activeFileIdx];
+          closedTabsRef.current = [closed, ...closedTabsRef.current.filter(t => t.path !== closed.path)].slice(0, 20);
+          closeEditor(closed.path);
+        }
+        return;
+      }
+      // Ctrl+Shift+T — reopen last closed tab
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'T') {
+        if (closedTabsRef.current.length > 0) {
+          e.preventDefault();
+          const tab = closedTabsRef.current.shift();
+          openFileAtLine(tab.path, tab.line || 1, tab.col || 1);
+        }
+        return;
+      }
+      // Ctrl+Tab — next editor tab
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Tab' && !e.shiftKey) {
+        if (ws?.editorFiles?.length > 1) {
+          e.preventDefault();
+          const next = (ws.activeFileIdx + 1) % ws.editorFiles.length;
+          updateActive({ activeFileIdx: next });
+        }
+        return;
+      }
+      // Ctrl+Shift+Tab — prev editor tab
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'Tab') {
+        if (ws?.editorFiles?.length > 1) {
+          e.preventDefault();
+          const prev = (ws.activeFileIdx - 1 + ws.editorFiles.length) % ws.editorFiles.length;
+          updateActive({ activeFileIdx: prev });
+        }
+        return;
+      }
       if (ws && (ws.activeFileIdx >= 0 && ws.editorFiles?.length > 0)) return;
       if ((e.ctrlKey || e.metaKey) && e.key === 'r') { e.preventDefault(); runActive(); }
       if ((e.ctrlKey || e.metaKey) && e.key === 'l') { e.preventDefault(); clearLogs(); }
       if ((e.ctrlKey || e.metaKey) && e.key === 'b' && ws?.info) { e.preventDefault(); runCmd(ws.info.build_cmd, 'Build'); }
       if ((e.ctrlKey || e.metaKey) && e.key === 't' && ws?.info?.test_cmd) { e.preventDefault(); runCmd(ws.info.test_cmd, 'Test'); }
+      // Ctrl+Shift+? — show shortcuts modal
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === '?' || e.key === '/')) {
+        e.preventDefault(); setShowShortcuts(s => !s); return;
+      }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [runActive, runCmd, clearLogs, ws]);
-
-  const projectSummary = () => {
-    if (!ws?.info) return '';
-    const parts = [];
-    if (ws.info.version) parts.push(ws.info.version);
-    return parts.join('  ·  ');
-  };
+  }, [runActive, runCmd, clearLogs, ws, closeEditor, openFileAtLine, updateActive]);
 
   const modeLabel = (ws?.info?.modes?.find(m => m.id === ws.activeMode) || ws?.info?.modes?.[0])?.label || 'Compilar';
 
@@ -825,7 +1044,16 @@ function App() {
   }) || null;
 
   return (
-    <div className="h-screen flex flex-col bg-[#0c0d14] font-sans">
+    <div className="h-screen flex flex-col bg-[#0c0d14] font-sans"
+      onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }}
+      onDrop={(e) => {
+        e.preventDefault();
+        const files = e.dataTransfer.files;
+        if (files.length > 0) {
+          const path = files[0].path;
+          if (path) openProject(path);
+        }
+      }}>
       {/* ── PROJECT TABS ── */}
       <ProjectTabs
         projects={projectOrder.map(p => ({ path: p, label: shortPath(p), info: projects[p]?.info }))}
@@ -884,6 +1112,27 @@ function App() {
                   <input type="range" min="8" max="24" value={consoleFontSize}
                     onChange={e => { const v = parseInt(e.target.value, 10); setConsoleFontSize(v); settings.set('console_font_size', v); }}
                     className="w-full h-1 rounded-full appearance-none bg-gray-700 cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-gray-300" />
+                </div>
+                <div className="px-3 py-1 text-[7px] font-bold uppercase tracking-[0.2em] text-gray-600">Actualización</div>
+                <div className="px-3 py-2">
+                  <button onClick={async () => {
+                    try {
+                      const update = await check();
+                      if (update?.isAvailable) {
+                        addLog(`📦 Update disponible: ${update.version}`, 'info');
+                        saveProjectState();
+                        await update.downloadAndInstall();
+                      } else {
+                        addLog('✓ No hay actualizaciones disponibles', 'ok');
+                      }
+                    } catch (e) {
+                      addLog(`Update error: ${e}`, 'err');
+                    }
+                  }}
+                    className="neon-btn neon-btn-cyan w-full py-1.5 rounded-lg text-[9px] font-bold flex items-center justify-center gap-1.5">
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>
+                    Check for Updates
+                  </button>
                 </div>
               </div>
             )}
@@ -968,6 +1217,7 @@ function App() {
           {ws?.info && ws.sidebarOpen && (
           <Panel defaultSize={200} minSize={140} maxSize={350}>
             <aside className="h-full flex flex-col gap-2 overflow-hidden min-h-0 sidebar-enter">
+              {ws.info.modes.length > 0 && (
               <div className="flex gap-1 px-1">
                 <button onClick={runActive} disabled={running}
                   className="neon-btn neon-btn-cyan flex-1 py-1.5 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1.5">
@@ -994,6 +1244,7 @@ function App() {
                   </>
                 )}
               </div>
+              )}
               <div className="flex-1 flex min-h-0">
                 <div className="flex flex-col gap-1 py-1 pr-1 shrink-0">
                   <button onClick={() => updateActive({ explorerTab: 'files' })}
@@ -1015,18 +1266,72 @@ function App() {
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/><line x1="5" y1="3" x2="3" y2="5"/><line x1="19" y1="3" x2="21" y2="5"/></svg>
                     {ws.debugSessionId && <span className="absolute top-0.5 right-0.5 w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shadow-[0_0_4px_rgba(0,255,136,0.5)]" />}
                   </button>
+                  <button onClick={() => openInExplorer(ws.path, { isDir: true }).catch(e => {
+                    const message = `No se pudo abrir el Explorador: ${e?.message || e}`;
+                    addLog(message, 'err');
+                    showToast(message, 'err');
+                  })}
+                    className="w-8 h-8 flex items-center justify-center rounded-lg transition-all cursor-pointer text-sm text-gray-600 hover:text-gray-400 hover:bg-white/[0.03]"
+                    title="Abrir en Explorador">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><polyline points="9 14 12 11 15 14"/></svg>
+                  </button>
                 </div>
                 <div className="flex-1 bg-[#13151e]/25 rounded-xl border border-white/[0.04] overflow-y-auto p-1 min-h-0">
                   {ws.explorerTab === 'files' ? (
                     <div className="flex flex-col h-full overflow-hidden">
                       <div className="px-2 py-1.5 border-b border-white/[0.04] shrink-0">
+                        <div className="flex gap-1 mb-1">
+                          <button onClick={() => setNewItemType(newItemType === 'file' ? null : 'file')}
+                            className={`flex-1 text-[8px] font-bold py-1 rounded transition-colors cursor-pointer flex items-center justify-center gap-1
+                              ${newItemType === 'file' ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30' : 'bg-white/[0.04] text-gray-600 hover:text-gray-400'}`}
+                            title="New file">
+                            <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                            File
+                          </button>
+                          <button onClick={() => setNewItemType(newItemType === 'folder' ? null : 'folder')}
+                            className={`flex-1 text-[8px] font-bold py-1 rounded transition-colors cursor-pointer flex items-center justify-center gap-1
+                              ${newItemType === 'folder' ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30' : 'bg-white/[0.04] text-gray-600 hover:text-gray-400'}`}
+                            title="New folder">
+                            <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                            Folder
+                          </button>
+                        </div>
+                        {newItemType && (
+                          <>
+                          <p className="text-[8px] text-gray-600 truncate mb-1 font-mono" title={ws.path}>
+                            se creará en: <span className="text-gray-400">{baseName(ws.path)}/</span>
+                          </p>
+                          <div className="flex gap-1">
+                            <input value={newItemName} onChange={e => setNewItemName(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter' && newItemName.trim()) {
+                                  const fullPath = joinPath(ws.path, newItemName.trim());
+                                  invoke(newItemType === 'file' ? 'create_file' : 'create_folder', { path: fullPath })
+                                    .then(() => { addLog(`Created ${newItemType}: ${newItemName}`, 'ok'); setNewItemName(''); setNewItemType(null); updateActive({ treeKey: (ws.treeKey || 0) + 1 }); })
+                                    .catch(err => addLog(String(err), 'err'));
+                                }
+                                if (e.key === 'Escape') { setNewItemType(null); setNewItemName(''); }
+                              }}
+                              placeholder={newItemType === 'file' ? 'filename.ext' : 'folder-name'}
+                              className="flex-1 bg-[#1a1e2e] text-[10px] text-gray-300 placeholder:text-gray-700 rounded px-1.5 py-1 border border-white/[0.08] outline-none font-mono focus:border-cyan-500/40 transition-all" autoFocus />
+                            <button onClick={() => {
+                              if (newItemName.trim()) {
+                                const fullPath = joinPath(ws.path, newItemName.trim());
+                                invoke(newItemType === 'file' ? 'create_file' : 'create_folder', { path: fullPath })
+                                  .then(() => { addLog(`Created ${newItemType}: ${newItemName}`, 'ok'); setNewItemName(''); setNewItemType(null); updateActive({ treeKey: (ws.treeKey || 0) + 1 }); })
+                                  .catch(err => addLog(String(err), 'err'));
+                              }
+                            }} className="text-[8px] text-emerald-400 hover:text-emerald-300 px-1.5 py-0.5 rounded bg-emerald-500/10 font-bold">✓</button>
+                          </div>
+                          </>
+                        )}
                         <input value={ws.fileFilter} onChange={e => updateActive({ fileFilter: e.target.value })}
                           placeholder="Filter files…" className="w-full bg-[#1a1e2e] text-[10px] text-gray-400 placeholder:text-gray-700
                             rounded-lg px-2 py-1 border border-white/[0.06] outline-none font-mono
                             focus:border-gray-500/40 focus:text-gray-200 transition-all" />
                       </div>
                       <div className="flex-1 overflow-y-auto min-h-0">
-                        <FileTree key={`${ws.path}-${ws.treeKey}`} rootPath={ws.path} onOpenFile={openFile} selectedFile={editorFile?.path} filter={ws.fileFilter} gitStatus={ws.gitEntries ? Object.fromEntries(ws.gitEntries.map(([s, f]) => [f.split(/[\\/]/).pop(), s])) : undefined} />
+                        <FileTree key={`${ws.path}-${ws.treeKey}`} rootPath={ws.path} onOpenFile={openFile} selectedFile={editorFile?.path} filter={ws.fileFilter} onLog={addLog} gitStatus={ws.gitEntries ? Object.fromEntries(ws.gitEntries.map(([s, f]) => [relativeTo(ws.path, f), s])) : undefined} />
                       </div>
                     </div>
                   ) : ws.explorerTab === 'git' ? (
@@ -1043,6 +1348,16 @@ function App() {
                                 className="neon-btn neon-btn-cyan text-[8px] px-1.5 py-0.5 rounded font-semibold">Pull</button>
                               <button onClick={() => { addLog('Pushing...', 'dim'); invoke('git_push', { path: ws.path }).then(r => addLog(r, 'ok')).catch(e => addLog(String(e), 'err')).then(refreshGit); }}
                                 className="neon-btn neon-btn-pink text-[8px] px-1.5 py-0.5 rounded font-semibold">Push</button>
+                              <button onClick={async () => {
+                                addLog('Updating all projects...', 'dim');
+                                const paths = projectOrder;
+                                try {
+                                  const results = await invoke('git_pull_all', { paths });
+                                  results.forEach(r => addLog(r, r.startsWith('OK') ? 'ok' : 'err'));
+                                  refreshGit();
+                                } catch (e) { addLog(String(e), 'err'); }
+                              }}
+                                className="neon-btn neon-btn-green text-[8px] px-1.5 py-0.5 rounded font-semibold">Update All</button>
                             </div>
                           )}
                         </div>
@@ -1103,7 +1418,7 @@ function App() {
                                   <span className="text-[10px] font-bold text-emerald-400 ml-1.5">Staged Changes</span>
                                   <span className="text-[9px] font-mono text-emerald-500/60 ml-1">{gitStaged.length}</span>
                                   <div className="flex-1" />
-                                  <button onClick={(e) => { e.stopPropagation(); Promise.all(gitStaged.map(([_, file]) => invoke('git_unstage', { path: ws.path, file }).catch(() => {}))).then(() => { refreshGit(); addLog('Unstaged all', 'ok'); }).catch(e => addLog(String(e), 'err')); }}
+                                  <button onClick={(e) => { e.stopPropagation(); Promise.all(gitStaged.map(([_, file]) => invoke('git_unstage', { path: ws.path, file }))).then(() => { refreshGit(); addLog('Unstaged all', 'ok'); }).catch(e => addLog(String(e), 'err')); }}
                                     className="text-[7px] font-bold text-red-400/50 hover:text-red-400 transition-colors px-1.5 py-0.5 rounded bg-red-500/10 hover:bg-red-500/20">
                                     − All
                                   </button>
@@ -1143,7 +1458,7 @@ function App() {
                                   <span className="text-[10px] font-bold text-gray-300 ml-1.5">Changes</span>
                                   <span className="text-[9px] font-mono text-gray-500/60 ml-1">{gitModified.length + gitUntracked.length}</span>
                                   <div className="flex-1" />
-                                  <button onClick={(e) => { e.stopPropagation(); [...gitModified, ...gitUntracked].forEach(([_, file]) => invoke('git_add', { path: ws.path, file }).catch(() => {})); refreshGit(); }}
+                                  <button onClick={(e) => { e.stopPropagation(); Promise.all([...gitModified, ...gitUntracked].map(([_, file]) => invoke('git_add', { path: ws.path, file }))).then(() => refreshGit()).catch(err => addLog(String(err), 'err')); }}
                                     className="text-[7px] font-bold text-emerald-400/50 hover:text-emerald-400 transition-colors px-1.5 py-0.5 rounded bg-emerald-500/10 hover:bg-emerald-500/20">
                                     + All
                                   </button>
@@ -1158,7 +1473,6 @@ function App() {
                                     {[...gitModified, ...gitUntracked].map(([status, file], i) => {
                                       const isModified = status !== '??' && status !== '!!';
                                       const isUntracked = status === '??';
-                                      const isIgnored = status === '!!';
                                       const badgeColor = isModified
                                         ? (status[1] === 'M' ? 'bg-amber-500/20 text-amber-300' : 'bg-red-500/20 text-red-300')
                                         : isUntracked ? 'bg-gray-500/20 text-gray-400' : 'bg-gray-500/10 text-gray-600';
@@ -1195,6 +1509,43 @@ function App() {
                                 </button>
                               </div>
                             </div>
+                            {/* ── COMMIT HISTORY ── */}
+                            {gitLog.length > 0 && (
+                              <div className="bg-[#13151e]/40 rounded-xl border border-white/[0.04] overflow-hidden">
+                                <div className="flex items-center px-3 py-2 border-b border-white/[0.04] cursor-pointer select-none"
+                                  onClick={() => updateActive(prev => ({ gitOpenCards: { ...prev.gitOpenCards, history: !prev.gitOpenCards.history } }))}>
+                                  <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
+                                    className={`text-gray-500/60 transition-transform duration-150 shrink-0 ${ws.gitOpenCards.history ? 'rotate-90' : ''}`}>
+                                    <polyline points="9 18 15 12 9 6" />
+                                  </svg>
+                                  <span className="text-[13px] ml-1">📋</span>
+                                  <span className="text-[10px] font-bold text-gray-300 ml-1.5">History</span>
+                                  <span className="text-[9px] font-mono text-gray-500/60 ml-1">{gitLog.length}</span>
+                                </div>
+                                <div style={{
+                                  maxHeight: ws.gitOpenCards.history ? '4000px' : '0px',
+                                  opacity: ws.gitOpenCards.history ? 1 : 0,
+                                  overflow: 'hidden',
+                                  transition: 'max-height 200ms ease, opacity 150ms ease',
+                                }}>
+                                  <div className="divide-y divide-white/[0.03]">
+                                    {gitLog.map(([, short, author, time, msg], i) => (
+                                      <div key={i} className="px-3 py-2 hover:bg-white/[0.02] transition-colors group">
+                                        <div className="flex items-center gap-2">
+                                          <span className="text-[9px] font-mono text-cyan-400/70 bg-cyan-500/10 px-1.5 py-[1px] rounded">{short}</span>
+                                          <span className="text-[10px] text-gray-300 truncate flex-1">{msg}</span>
+                                        </div>
+                                        <div className="flex items-center gap-2 mt-1 ml-[28px]">
+                                          <span className="text-[8px] text-gray-600">{author}</span>
+                                          <span className="text-[8px] text-gray-700">·</span>
+                                          <span className="text-[8px] text-gray-600">{time}</span>
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              </div>
+                            )}
                           </>
                         )}
                       </div>
@@ -1264,7 +1615,7 @@ function App() {
               <Separator className="h-1 bg-white/5 hover:bg-gray-500/50 transition-colors cursor-row-resize" />
               <Panel minSize={15} defaultSize={45}>
             <div className="h-full flex flex-col overflow-hidden min-w-0">
-              {ws?.info && (
+              {ws?.info && ws.info.modes.length > 0 && (
                 <div className="flex items-center gap-1 bg-[#13151e]/25 rounded-xl border border-white/[0.04] px-1.5 py-1 mb-1.5 shrink-0 select-none flex-wrap">
                   <div className="relative" ref={modeRef}>
                     <button onClick={() => setShowCmdMenu(s => s === 'mode' ? null : 'mode')}
@@ -1400,10 +1751,16 @@ function App() {
                       className="text-gray-500 hover:text-amber-400 transition-colors px-1.5 py-0.5 rounded-md text-[10px] font-bold shrink-0 cursor-pointer"
                       title="New PowerShell terminal">+</button>
                   )}
-                  {ws && ws.activeConsoleTab === 'consola' && (
+                   {ws && ws.activeConsoleTab === 'consola' && (
                     <>
                       <div className="flex-1 min-w-[4px]" />
                       <div className="flex items-center gap-2 shrink-0">
+                        <button onClick={() => { const v = !compactTerminal; setCompactTerminal(v); settings.set('compact_terminal', v); }}
+                          className={`text-[9px] px-1.5 py-0.5 rounded font-bold tracking-wide transition-all cursor-pointer
+                            ${compactTerminal ? 'text-cyan-400 bg-cyan-500/10 border border-cyan-500/20' : 'text-gray-600 hover:text-gray-400'}`}
+                          title="Compact mode: collapse repeated output to save tokens">
+                          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="4 21 4 14 20 14 20 21"/><polyline points="4 14 4 3 20 3 20 14"/></svg>
+                        </button>
                         <input value={consoleSearch} onChange={e => setConsoleSearch(e.target.value)}
                           placeholder="Ctrl+F" className="w-20 bg-[#1a1e2e] text-[10px] text-gray-400 placeholder:text-gray-700
                             rounded-lg px-2 py-1 border border-white/[0.06] outline-none font-mono
@@ -1478,41 +1835,55 @@ function App() {
           </button>
         </div>
       )}
-    </div>
-  );
-}
-
-function ExplorerSection({ title, icon, children, defaultOpen }) {
-  const [open, setOpen] = useState(defaultOpen ?? true);
-  return (
-    <div className="bg-[#13151e]/30 rounded-xl border border-white/[0.04] overflow-hidden">
-      <button onClick={() => setOpen(!open)}
-        className="w-full flex items-center gap-1.5 px-3 py-1.5 text-[9px] font-bold uppercase tracking-[0.2em]
-          text-gray-500 hover:text-gray-300 transition-colors cursor-pointer group">
-        <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
-          className={`shrink-0 transition-transform duration-150 ${open ? 'rotate-90' : ''}`}>
-          <polyline points="9 18 15 12 9 6" />
-        </svg>
-        <span className="shrink-0">{icon}</span>
-        <span>{title}</span>
-      </button>
-      <div style={{
-        maxHeight: open ? '4000px' : '0px',
-        opacity: open ? 1 : 0,
-        overflow: 'hidden',
-        transition: 'max-height 250ms cubic-bezier(0.4, 0, 0.2, 1), opacity 200ms ease',
-      }}>
-        <div className="pb-1.5">{children}</div>
-    </div>
-    </div>
-  );
-}
-
-function KV({ label, value, mono = false }) {
-  return (
-    <div className="flex justify-between items-center gap-2 min-w-0">
-      <span className="text-[10px] text-gray-600 font-medium uppercase tracking-wider shrink-0">{label}</span>
-      <span className={`text-[10px] text-gray-400 truncate ${mono ? 'font-mono' : ''}`} title={value}>{value || '—'}</span>
+      {/* ── SHORTCUTS MODAL ── */}
+      {showShortcuts && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowShortcuts(false)}>
+          <div className="bg-[#0e1118] border border-white/[0.08] rounded-2xl shadow-2xl w-[440px] max-h-[80vh] overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-5 py-3 border-b border-white/[0.06]">
+              <span className="text-[12px] font-bold text-white">Keyboard Shortcuts</span>
+              <button onClick={() => setShowShortcuts(false)} className="text-gray-500 hover:text-white transition-colors cursor-pointer">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              </button>
+            </div>
+            <div className="overflow-y-auto max-h-[calc(80vh-48px)] p-4 space-y-4">
+              {[
+                { title: 'General', shortcuts: [
+                  ['Ctrl+P', 'Buscar archivo'],
+                  ['Ctrl+Shift+?', 'Mostrar atajos'],
+                  ['Ctrl+R', 'Run mode actual'],
+                  ['Ctrl+B', 'Build'],
+                  ['Ctrl+T', 'Test'],
+                  ['Ctrl+L', 'Limpiar consola'],
+                ]},
+                { title: 'Editor', shortcuts: [
+                  ['Ctrl+W', 'Cerrar pestaña'],
+                  ['Ctrl+Shift+T', 'Reabrir pestaña cerrada'],
+                  ['Ctrl+Tab', 'Siguiente pestaña'],
+                  ['Ctrl+Shift+Tab', 'Pestaña anterior'],
+                  ['Ctrl+S', 'Guardar archivo'],
+                  ['Ctrl+F', 'Buscar en consola/archivo'],
+                ]},
+                { title: 'Terminal', shortcuts: [
+                  ['Ctrl+C', 'Copiar (con selección) / Interrumpir (sin selección)'],
+                  ['Ctrl+V', 'Pegar desde portapapeles'],
+                ]},
+              ].map(({ title, shortcuts }) => (
+                <div key={title}>
+                  <h3 className="text-[9px] font-bold uppercase tracking-[0.2em] text-gray-500 mb-2">{title}</h3>
+                  <div className="space-y-1">
+                    {shortcuts.map(([key, desc]) => (
+                      <div key={key} className="flex items-center justify-between py-1">
+                        <span className="text-[10px] text-gray-400">{desc}</span>
+                        <kbd className="text-[9px] font-mono text-cyan-300 bg-cyan-500/10 px-2 py-0.5 rounded border border-cyan-500/20">{key}</kbd>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1541,5 +1912,13 @@ try {
     <React.StrictMode><ErrorBoundary><App /></ErrorBoundary></React.StrictMode>
   );
 } catch (e) {
-  document.body.innerHTML = `<pre style="color:red;padding:20px">${e.message}\n${e.stack}</pre>`;
+  const root = document.getElementById('root');
+  if (root) {
+    root.textContent = '';
+    const pre = document.createElement('pre');
+    pre.style.color = 'red';
+    pre.style.padding = '20px';
+    pre.textContent = `${e.message}\n${e.stack}`;
+    root.appendChild(pre);
+  }
 }

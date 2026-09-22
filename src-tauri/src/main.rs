@@ -27,6 +27,185 @@ use tauri::{AppHandle, Emitter, Manager};
 static CHILD_PIDS: std::sync::LazyLock<Mutex<HashMap<String, u32>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT_TERM_ID: AtomicU32 = AtomicU32::new(1);
 
+// ── Path allowlist: only roots registered via detect_project / register_root ──
+static ALLOWED_ROOTS: std::sync::LazyLock<Mutex<Vec<PathBuf>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+#[tauri::command]
+fn register_root(path: String) {
+    let p = PathBuf::from(&path);
+    let canon = if p.exists() {
+        p.canonicalize().unwrap_or(p)
+    } else {
+        p
+    };
+    let mut roots = ALLOWED_ROOTS.lock().unwrap();
+    if !roots.iter().any(|r| r == &canon) {
+        roots.push(canon);
+    }
+}
+
+fn ensure_allowed(path: &str) -> Result<PathBuf, String> {
+    let raw = PathBuf::from(path);
+    // Reject any path that still contains `..` after naive normalization
+    let mut cleaned = PathBuf::new();
+    for comp in raw.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                if !cleaned.pop() {
+                    return Err("Ruta no permitida".into());
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => cleaned.push(other.as_os_str()),
+        }
+    }
+    let roots = ALLOWED_ROOTS.lock().unwrap();
+    if roots.is_empty() {
+        return Err("No hay proyectos abiertos".into());
+    }
+    // Canonicalize the deepest existing ancestor of the requested path
+    let mut probe = cleaned.clone();
+    let existing = loop {
+        if probe.exists() {
+            break probe.canonicalize().unwrap_or(probe.clone());
+        }
+        if !probe.pop() {
+            break cleaned.clone();
+        }
+    };
+    let allowed = roots.iter().any(|root| existing.starts_with(root));
+    if !allowed {
+        return Err(format!("Ruta fuera del proyecto: {}", path));
+    }
+    Ok(cleaned)
+}
+
+// ── Debugger (jdb) sessions ──
+struct DebugSession {
+    writer: Mutex<std::process::ChildStdin>,
+}
+
+static DEBUG_SESSIONS: std::sync::LazyLock<Mutex<HashMap<u32, DebugSession>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_DEBUG_ID: AtomicU32 = AtomicU32::new(1);
+
+#[tauri::command]
+async fn debug_attach(app: AppHandle, port: u16) -> Result<u32, String> {
+    // Retry loop: the JVM may not have opened the JDWP port yet.
+    const MAX_ATTEMPTS: u32 = 15;
+    const RETRY_MS: u64 = 400;
+    let mut attempt = 0u32;
+    let mut child = loop {
+        attempt += 1;
+        let mut cmd = Command::new("jdb");
+        cmd.args(["-attach", &format!("127.0.0.1:{}", port)])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(HIDDEN_PROCESS);
+        }
+        match cmd.spawn() {
+            Ok(mut c) => {
+                // Detect immediate spawn failure (bad attach) by polling try_wait briefly.
+                let mut settled = false;
+                for _ in 0..8 {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    match c.try_wait() {
+                        Ok(Some(status)) => {
+                            // jdb exited quickly -> attachment failed, retry
+                            debug_log(&format!("jdb exited early: {}", status));
+                            settled = true;
+                            break;
+                        }
+                        Ok(None) => {
+                            settled = true;
+                            break;
+                        }
+                        Err(_) => {
+                            settled = true;
+                            break;
+                        }
+                    }
+                }
+                if settled {
+                    if c.try_wait().ok().flatten().is_some() {
+                        // already dead — retry
+                        if attempt < MAX_ATTEMPTS {
+                            std::thread::sleep(std::time::Duration::from_millis(RETRY_MS));
+                            continue;
+                        }
+                        return Err(format!("No se pudo conectar al debugger en el puerto {}", port));
+                    }
+                    break c;
+                }
+                break c;
+            }
+            Err(e) => {
+                if attempt >= MAX_ATTEMPTS {
+                    return Err(format!("No se pudo iniciar jdb: {}", e));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(RETRY_MS));
+            }
+        }
+    };
+
+    let id = NEXT_DEBUG_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    let stdin = child.stdin.take().ok_or("jdb stdin no disponible")?;
+    let stdout = child.stdout.take().ok_or("jdb stdout no disponible")?;
+    let stderr = child.stderr.take().ok_or("jdb stderr no disponible")?;
+
+    {
+        let mut sessions = DEBUG_SESSIONS.lock().unwrap();
+        sessions.insert(id, DebugSession { writer: Mutex::new(stdin) });
+    }
+
+    // Reader threads: forward jdb output to the frontend as `debug-output`.
+    let app_out = app.clone();
+    thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            let _ = app_out.emit("debug-output", serde_json::json!({ "data": format!("{}\n", line) }));
+        }
+    });
+    let app_err = app.clone();
+    thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            let _ = app_err.emit("debug-output", serde_json::json!({ "data": format!("{}\n", line) }));
+        }
+    });
+
+    // Waiter: clean up session when jdb exits.
+    let app_wait = app.clone();
+    thread::spawn(move || {
+        let _ = child.wait();
+        DEBUG_SESSIONS.lock().unwrap().remove(&id);
+        let _ = app_wait.emit("debug-output", serde_json::json!({ "data": "[jdb exited]\n" }));
+    });
+
+    Ok(id)
+}
+
+#[tauri::command]
+async fn debug_cmd(session_id: u32, cmd: String) -> Result<(), String> {
+    let sessions = DEBUG_SESSIONS.lock().unwrap();
+    let session = sessions
+        .get(&session_id)
+        .ok_or("Sesión de debugger no encontrada")?;
+    let mut writer = session
+        .writer
+        .lock()
+        .map_err(|_| "Sesión de debugger bloqueada".to_string())?;
+    writeln!(writer, "{}", cmd).map_err(|e| format!("No se pudo enviar comando a jdb: {}", e))?;
+    writer.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -364,6 +543,7 @@ async fn detect_project(path: String) -> Result<ProjectInfo, String> {
     eprintln!("[DEBUG] detect_project: path does not exist: {:?}", &p);
     return Err(format!("No existe: {}", path));
   }
+  register_root(path.clone());
   eprintln!("[DEBUG] detect_project: path exists, scanning for project type...");
 
   // ─── MAVEN ───
@@ -1208,7 +1388,7 @@ async fn run_cmd(app: AppHandle, path: String, cmd: String, debug_port: Option<i
     emitl(&app, format!("🐛 JDWP debug on port {}{}", port, hint), "info");
     emitl(&app, format!("📎 Attach: jdb -attach localhost:{}", port), "dim");
     emitl(&app, "🔧 Para VS Code crear .vscode/launch.json con:".to_string(), "dim");
-    emitl(&app, r#"{"type":"java","request":"attach","name":"ATL Debug","hostName":"localhost","port":<PORT>}"#.to_string(), "dim");
+    emitl(&app, r#"{"type":"java","request":"attach","name":"PillLauncher Debug","hostName":"localhost","port":<PORT>}"#.to_string(), "dim");
     dc
   } else { cmd };
   emitl(&app, format!("> {}", cmd), "info");
@@ -1335,7 +1515,18 @@ fn resume_cmd(path: String) -> Result<(), String> {
 // ══════════════════════════════════════════════════
 
 #[cfg(windows)]
-fn shell_program() -> &'static str { "pwsh.exe" }
+fn shell_program() -> &'static str {
+    // PowerShell 7 is optional on Windows.  Prefer it when installed, but keep
+    // the integrated terminal usable on standard Windows installations too.
+    let has_on_path = |program: &str| {
+        std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+            .unwrap_or(false)
+    };
+    if has_on_path("pwsh.exe") { "pwsh.exe" }
+    else if has_on_path("powershell.exe") { "powershell.exe" }
+    else { "cmd.exe" }
+}
 #[cfg(not(windows))]
 fn shell_program() -> &'static str { "bash" }
 
@@ -1386,7 +1577,12 @@ fn spawn_portable_pty(dir: &std::path::Path, app: &AppHandle, id: &str, cols: u1
 
     let mut cmd = CommandBuilder::new(shell_program());
     cmd.cwd(dir);
-    cmd.arg("-NoLogo");
+    if shell_program().eq_ignore_ascii_case("cmd.exe") {
+        cmd.arg("/Q");
+    } else {
+        cmd.arg("-NoLogo");
+        cmd.arg("-NoProfile");
+    }
     cmd.env("TERM", "xterm-256color");
     let child = pair.slave.spawn_command(cmd)
         .map_err(|e| format!("spawn_portable_pty: spawn_command failed: {}", e))?;
@@ -1707,9 +1903,6 @@ fn start_terminal(app: AppHandle, path: String, initial_cmd: Option<String>, _sh
             if let Some(cmd) = initial_cmd {
                 let _ = s.write_stdin(format!("{}\r\n", cmd).as_bytes());
                 let _ = s.flush_stdin();
-            } else if !path.is_empty() {
-                let _ = s.write_stdin(format!("cd \"{}\"\r\n", path).as_bytes());
-                let _ = s.flush_stdin();
             }
         }
     }
@@ -1772,11 +1965,14 @@ fn spawn_winpty_session(winpty: &std::path::Path, dir: &str, app: &AppHandle, id
 }
 
 fn fallback_pipe_session(dir: &str, app: &AppHandle, id: &str) -> Result<(TerminalSession, bool), String> {
-    debug_log("fallback_pipe_session: starting PowerShell with pipes");
-    let mut child = hid_cmd(shell_program())
-        .arg("-NoProfile")
-        .arg("-Command")
-        .arg("-")
+    debug_log("fallback_pipe_session: starting pwsh with pipes");
+    let mut command = hid_cmd(shell_program());
+    if shell_program().eq_ignore_ascii_case("cmd.exe") {
+        command.arg("/Q");
+    } else {
+        command.arg("-NoLogo").arg("-NoProfile").arg("-NonInteractive");
+    }
+    let mut child = command
         .current_dir(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1790,9 +1986,13 @@ fn fallback_pipe_session(dir: &str, app: &AppHandle, id: &str) -> Result<(Termin
 
     debug_log(&format!("fallback_pipe_session: child spawned OK, pid={}", child.id()));
 
-    let stdin = child.stdin.take().ok_or_else(|| { debug_log("No stdin"); "No stdin".to_string() })?;
+    let mut stdin = child.stdin.take().ok_or_else(|| { debug_log("No stdin"); "No stdin".to_string() })?;
     let stdout = child.stdout.take().ok_or_else(|| { debug_log("No stdout"); "No stdout".to_string() })?;
     let stderr = child.stderr.take().ok_or_else(|| { debug_log("No stderr"); "No stderr".to_string() })?;
+
+    // Write a marker to know shell is ready
+    let _ = stdin.write_all(b"\n");
+    let _ = stdin.flush();
 
     debug_log("fallback_pipe_session: starting reader threads");
     start_reader_thread(stdout, app.clone(), id.to_string(), true);
@@ -1911,7 +2111,7 @@ fn launch_external_terminal(path: String, initial_cmd: String) -> Result<(), Str
     {
         let full_cmd = format!("cmd.exe /K \"cd /d \"{}\" && {}\"", path, initial_cmd);
         Command::new("cmd")
-            .args(["/C", "start", "ATL Terminal", &full_cmd])
+            .args(["/C", "start", "PillLauncher Terminal", &full_cmd])
             .creation_flags(HIDDEN_PROCESS)
             .spawn()
             .map_err(|e| format!("Failed to launch terminal: {}", e))?;
@@ -1935,6 +2135,29 @@ fn git_pull(path: String) -> Result<String, String> {
   let stderr = String::from_utf8(out.stderr).map_err(|_| "git: utf8 error".to_string())?;
   if !out.status.success() { return Err(stderr.trim().to_string()); }
   Ok(stdout.trim().to_string())
+}
+
+#[tauri::command]
+fn git_pull_all(paths: Vec<String>) -> Result<Vec<String>, String> {
+  let mut results = Vec::new();
+  for path in paths {
+    eprintln!("[DEBUG] git_pull_all: pulling {:?}", &path);
+    match hid_cmd("git").args(["-C", &path, "pull"]).output() {
+      Ok(out) => {
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if out.status.success() {
+          results.push(format!("OK {}: {}", std::path::Path::new(&path).file_name().unwrap_or_default().to_string_lossy(), stdout));
+        } else {
+          results.push(format!("ERR {}: {}", std::path::Path::new(&path).file_name().unwrap_or_default().to_string_lossy(), stderr));
+        }
+      }
+      Err(e) => {
+        results.push(format!("ERR {}: {}", std::path::Path::new(&path).file_name().unwrap_or_default().to_string_lossy(), e));
+      }
+    }
+  }
+  Ok(results)
 }
 
 #[tauri::command]
@@ -2010,6 +2233,7 @@ fn git_commit(path: String, message: String) -> Result<String, String> {
 fn search_files(path: String, query: String) -> Result<Vec<String>, String> {
   eprintln!("[DEBUG] search_files: path={:?} query={:?}", &path, &query);
   if query.trim().is_empty() { return Ok(vec![]); }
+  let path = ensure_allowed(&path)?.to_string_lossy().to_string();
   let out = hid_cmd("cmd")
     .args(["/C", &format!("dir /s /b /a-d \"{}*\"", query.replace('"', ""))])
     .current_dir(&path)
@@ -2038,6 +2262,7 @@ fn mode(id: impl Into<String>, label: impl Into<String>, cmd: String) -> BuildMo
 #[tauri::command]
 fn resolve_bp_class(path: String) -> Result<String, String> {
     use std::fs;
+    let path = ensure_allowed(&path)?.to_string_lossy().to_string();
     let content = fs::read_to_string(&path).map_err(|e| format!("Cannot read {}: {}", path, e))?;
     let stem = std::path::Path::new(&path)
         .file_stem()
@@ -2210,9 +2435,10 @@ pub struct FileEntry {
 }
 
 #[tauri::command]
-fn list_dir(path: String) -> Result<Vec<FileEntry>, String> {
-  eprintln!("[DEBUG] list_dir called with path: {:?}", &path);
-  let p = PathBuf::from(&path);
+fn list_dir(path: String, show_hidden: Option<bool>) -> Result<Vec<FileEntry>, String> {
+  let show_hidden = show_hidden.unwrap_or(true);
+  eprintln!("[DEBUG] list_dir called with path: {:?} show_hidden: {}", &path, show_hidden);
+  let p = ensure_allowed(&path)?;
   if !p.exists() {
     eprintln!("[DEBUG] list_dir: path does not exist: {:?}", &p);
     return Err("Path does not exist".into());
@@ -2230,7 +2456,8 @@ fn list_dir(path: String) -> Result<Vec<FileEntry>, String> {
 
   for entry in rd.flatten() {
     let name = entry.file_name().to_string_lossy().to_string();
-    if name.starts_with('.') { continue; }
+    // ocultos (dotfiles) solo cuando el usuario los pide explicitamente
+    if !show_hidden && name.starts_with('.') { continue; }
     let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
     entries.push(FileEntry {
       is_symlink: entry.file_type().map(|t| t.is_symlink()).unwrap_or(false),
@@ -2252,7 +2479,7 @@ fn list_dir(path: String) -> Result<Vec<FileEntry>, String> {
 #[tauri::command]
 fn read_file(path: String) -> Result<FileInfo, String> {
     eprintln!("[DEBUG] read_file called with path: {:?}", &path);
-    let p = PathBuf::from(&path);
+    let p = ensure_allowed(&path)?;
     if !p.exists() {
         eprintln!("[DEBUG] read_file: file not found: {:?}", &p);
         return Err(format!("File not found: {}", path));
@@ -2274,7 +2501,8 @@ fn read_file(path: String) -> Result<FileInfo, String> {
 #[tauri::command]
 fn save_file(path: String, content: String) -> Result<(), String> {
     eprintln!("[DEBUG] save_file called with path: {:?}", &path);
-    std::fs::write(&path, &content).map_err(|e| {
+    let p = ensure_allowed(&path)?;
+    std::fs::write(&p, &content).map_err(|e| {
         eprintln!("[DEBUG] save_file error: {}", &e);
         format!("Cannot save file: {}", e)
     })
@@ -3252,6 +3480,37 @@ fn git_branches(path: String) -> Result<Vec<Vec<String>>, String> {
   Ok(result)
 }
 
+#[tauri::command]
+fn git_log(path: String, count: Option<u32>) -> Result<Vec<Vec<String>>, String> {
+  let n = count.unwrap_or(30);
+  let out = hid_cmd("git").args(["-C", &path, "log", &format!("-{}", n), "--pretty=format:%H|%h|%an|%ar|%s"])
+    .output().map_err(|e| format!("git: {}", e))?;
+  let s = String::from_utf8(out.stdout).map_err(|_| "git: utf8 error".to_string())?;
+  Ok(s.lines().filter(|l| !l.is_empty()).map(|l| {
+    let parts: Vec<String> = l.splitn(5, '|').map(|s| s.to_string()).collect();
+    parts
+  }).collect())
+}
+
+#[tauri::command]
+fn create_file(path: String) -> Result<(), String> {
+  let p = ensure_allowed(&path)?;
+  if p.exists() { return Err("Ya existe".into()); }
+  if let Some(parent) = p.parent() {
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+  }
+  std::fs::write(&p, "").map_err(|e| e.to_string())?;
+  Ok(())
+}
+
+#[tauri::command]
+fn create_folder(path: String) -> Result<(), String> {
+  let p = ensure_allowed(&path)?;
+  if p.exists() { return Err("Ya existe".into()); }
+  std::fs::create_dir_all(&p).map_err(|e| e.to_string())?;
+  Ok(())
+}
+
 // ══════════════════════════════════════════════════
 //  MAIN
 // ══════════════════════════════════════════════════
@@ -3275,10 +3534,11 @@ fn main() {
   }));
   eprintln!("[DEBUG] PillLauncher starting...");
   tauri::Builder::default()
-    .plugin(tauri_plugin_shell::init())
+    .plugin(tauri_plugin_opener::init())
     .plugin(tauri_plugin_dialog::init())
     .plugin(tauri_plugin_clipboard_manager::init())
-    .plugin(tauri_plugin_store::Builder::default().build())
+      .plugin(tauri_plugin_store::Builder::default().build())
+      .plugin(tauri_plugin_updater::Builder::new().build())
       .setup(|app| {
         // Each terminal tab gets its own pipe-based PowerShell process.
         // For TTY-dependent tools like codex, use winpty (install via UI).
@@ -3290,9 +3550,11 @@ fn main() {
       read_file, save_file, list_dir,
       git_status, git_branches, git_checkout, git_pull, git_push,
       git_fetch, git_commit, git_add, git_add_all, git_unstage,
-      git_stash, git_stash_pop, git_diff, git_remote_url,
+      git_stash, git_stash_pop, git_diff, git_remote_url, git_pull_all,
+      git_log, create_file, create_folder,
       search_files, log_error, resolve_bp_class,
-      start_terminal, write_terminal, stop_terminal, set_terminal_size, launch_external_terminal
+      start_terminal, write_terminal, stop_terminal, set_terminal_size, launch_external_terminal,
+      register_root, debug_attach, debug_cmd
     ])
     .run(tauri::generate_context!())
     .expect("PillLauncher failed to start");

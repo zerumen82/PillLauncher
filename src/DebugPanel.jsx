@@ -1,6 +1,3 @@
-import React from 'react';
-import { invoke } from '@tauri-apps/api/core';
-
 export default function DebugPanel({ sessionId, vars, stack, location, onCmd, debugPort, debugSuspend, onToggleSuspend, onPortChange }) {
   if (!sessionId) {
     return (
@@ -24,7 +21,7 @@ export default function DebugPanel({ sessionId, vars, stack, location, onCmd, de
           </button>
         </div>
         <div className="flex gap-1">
-          <button onClick={() => { const url = `jdb -attach localhost:${debugPort}`; navigator.clipboard.writeText(url).then(() => {}).catch(() => {}); }}
+          <button onClick={() => { const cmd = `jdb -attach localhost:${debugPort}`; navigator.clipboard.writeText(cmd).then(() => {}).catch(err => console.warn('clipboard write failed:', err)); }}
             className="text-[8px] text-gray-500 hover:text-cyan-400 transition-colors px-1.5 py-0.5 rounded font-mono cursor-pointer border border-white/[0.04]"
             title="Copiar comando JDWP">📋 Copy jdb cmd</button>
         </div>

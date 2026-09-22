@@ -9,6 +9,10 @@ const DEFAULTS = {
   recent: [],
   last_project: '',
   project_order: [],
+  saved_project_state: {},
+  compact_terminal: true,
+  max_log_lines: 500,
+  max_line_length: 300,
 };
 
 let store = null;

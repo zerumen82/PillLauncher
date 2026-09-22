@@ -182,7 +182,11 @@ body {
   top: 0;
   bottom: 0;
   width: 1px;
-  background: linear-gradient(to bottom, rgba(0,212,255,0.08), transparent 80%);
+  background: rgba(148,163,184,0.14);
+  transition: background 120ms ease;
+}
+.tree-indent-line:hover::before {
+  background: rgba(0,212,255,0.28);
 }
 
 /* ── File highlight match ── */

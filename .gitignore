@@ -26,11 +26,10 @@ src-tauri/target/
 # Generated builds
 build/
 
-# Test files
+# Test build artifacts
 test_conpty*.rs
 test_conpty*.exe
 test_conpty*.pdb
-tests/
 
 # Cargo config override
 src-tauri/.cargo/
